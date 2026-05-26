@@ -1,1 +1,27 @@
+# Python
+__pycache__/
+*.egg-info/
+*.pyc
+dist/
+build/
+
+# Virtual envs
+.venv/
+venv/
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local secrets / MCP config
+.env
+.mcp.json
+
+# Local Claude Code settings
+.claude/
+
+# Editor / OS
 .DS_Store
+.idea/
+.vscode/
