@@ -1,29 +1,26 @@
-"""Bitbucket Cloud REST API client."""
+"""Bitbucket Server/Data Center REST API client."""
 
 import requests
 from typing import Any, Dict, List, Optional
-from requests.auth import HTTPBasicAuth
 
 from bitbucket_mcp.errors import BitbucketError, handle_api_error
-
-BASE_URL = "https://api.bitbucket.org/2.0"
 
 
 class BitbucketClient:
 
-    def __init__(self, email: str, api_token: str, workspace: str):
-        self.base_url = BASE_URL
-        self.workspace = workspace
+    def __init__(self, base_url: str, api_token: str, project: str):
+        self.base_url = base_url.rstrip("/") + "/rest/api/1.0"
+        self.project = project
         self.session = requests.Session()
-        self.session.auth = HTTPBasicAuth(email, api_token)
         self.session.headers.update({
+            "Authorization": f"Bearer {api_token}",
             "Accept": "application/json",
             "Content-Type": "application/json",
         })
 
-    def _repo_url(self, repo_slug: str, workspace: Optional[str] = None) -> str:
-        ws = workspace or self.workspace
-        return f"{self.base_url}/repositories/{ws}/{repo_slug}"
+    def _repo_url(self, repo_slug: str, project: Optional[str] = None) -> str:
+        proj = project or self.project
+        return f"{self.base_url}/projects/{proj}/repos/{repo_slug}"
 
     def _request(
         self,
@@ -62,159 +59,152 @@ class BitbucketClient:
         except requests.exceptions.RequestException as e:
             raise BitbucketError(f"Request failed: {str(e)}")
 
+    # ===== PROJECTS =====
+
+    def list_projects(self, start: int = 0, limit: int = 50) -> Dict[str, Any]:
+        url = f"{self.base_url}/projects"
+        params: Dict[str, Any] = {"start": start, "limit": limit}
+        return self._request("GET", url, params=params)
+
     # ===== REPOSITORIES =====
 
     def list_repositories(
-        self, page: int = 1, pagelen: int = 25,
-        role: str = "", workspace: Optional[str] = None,
+        self, start: int = 0, limit: int = 25, project: Optional[str] = None,
     ) -> Dict[str, Any]:
-        ws = workspace or self.workspace
-        url = f"{self.base_url}/repositories/{ws}"
-        params: Dict[str, Any] = {"page": page, "pagelen": pagelen, "sort": "-updated_on"}
-        if role:
-            params["role"] = role
+        if project or self.project:
+            proj = project or self.project
+            url = f"{self.base_url}/projects/{proj}/repos"
+        else:
+            url = f"{self.base_url}/repos"
+        params: Dict[str, Any] = {"start": start, "limit": limit}
         return self._request("GET", url, params=params)
 
     # ===== PULL REQUESTS =====
 
     def list_pull_requests(
         self, repo_slug: str, state: str = "OPEN",
-        page: int = 1, pagelen: int = 25, workspace: Optional[str] = None,
+        start: int = 0, limit: int = 25, project: Optional[str] = None,
     ) -> Dict[str, Any]:
-        url = f"{self._repo_url(repo_slug, workspace)}/pullrequests"
-        params = {"state": state, "page": page, "pagelen": pagelen}
+        url = f"{self._repo_url(repo_slug, project)}/pull-requests"
+        params = {"state": state, "start": start, "limit": limit}
         return self._request("GET", url, params=params)
 
     def get_pull_request(
-        self, repo_slug: str, pr_id: int, workspace: Optional[str] = None,
+        self, repo_slug: str, pr_id: int, project: Optional[str] = None,
     ) -> Dict[str, Any]:
-        url = f"{self._repo_url(repo_slug, workspace)}/pullrequests/{pr_id}"
+        url = f"{self._repo_url(repo_slug, project)}/pull-requests/{pr_id}"
         return self._request("GET", url)
 
     def create_pull_request(
         self, repo_slug: str, title: str, source_branch: str,
         destination_branch: str = "main", description: str = "",
-        reviewers: Optional[List[str]] = None, close_source_branch: bool = True,
-        workspace: Optional[str] = None,
+        reviewers: Optional[List[str]] = None,
+        project: Optional[str] = None,
     ) -> Dict[str, Any]:
-        url = f"{self._repo_url(repo_slug, workspace)}/pullrequests"
+        proj = project or self.project
+        url = f"{self._repo_url(repo_slug, project)}/pull-requests"
         payload: Dict[str, Any] = {
             "title": title,
-            "source": {"branch": {"name": source_branch}},
-            "destination": {"branch": {"name": destination_branch}},
             "description": description,
-            "close_source_branch": close_source_branch,
+            "fromRef": {
+                "id": f"refs/heads/{source_branch}",
+                "repository": {"slug": repo_slug, "project": {"key": proj}},
+            },
+            "toRef": {
+                "id": f"refs/heads/{destination_branch}",
+                "repository": {"slug": repo_slug, "project": {"key": proj}},
+            },
         }
         if reviewers:
-            payload["reviewers"] = [{"uuid": uuid} for uuid in reviewers]
+            payload["reviewers"] = [{"user": {"name": slug}} for slug in reviewers]
         return self._request("POST", url, json=payload)
 
     def update_pull_request(
         self, repo_slug: str, pr_id: int, title: Optional[str] = None,
-        description: Optional[str] = None, workspace: Optional[str] = None,
+        description: Optional[str] = None, project: Optional[str] = None,
     ) -> Dict[str, Any]:
-        url = f"{self._repo_url(repo_slug, workspace)}/pullrequests/{pr_id}"
-        payload: Dict[str, Any] = {}
-        if title is not None:
-            payload["title"] = title
-        if description is not None:
-            payload["description"] = description
+        existing = self.get_pull_request(repo_slug, pr_id, project=project)
+        url = f"{self._repo_url(repo_slug, project)}/pull-requests/{pr_id}"
+        payload: Dict[str, Any] = {
+            "id": pr_id,
+            "version": existing["version"],
+            "title": title if title is not None else existing["title"],
+            "description": description if description is not None else existing.get("description", ""),
+            "toRef": existing["toRef"],
+            "reviewers": existing.get("reviewers", []),
+        }
         return self._request("PUT", url, json=payload)
 
     def merge_pull_request(
-        self, repo_slug: str, pr_id: int, merge_strategy: str = "merge_commit",
-        message: Optional[str] = None, close_source_branch: bool = True,
-        workspace: Optional[str] = None,
+        self, repo_slug: str, pr_id: int, message: Optional[str] = None,
+        project: Optional[str] = None,
     ) -> Dict[str, Any]:
-        url = f"{self._repo_url(repo_slug, workspace)}/pullrequests/{pr_id}/merge"
-        payload: Dict[str, Any] = {
-            "type": "pullrequest",
-            "merge_strategy": merge_strategy,
-            "close_source_branch": close_source_branch,
-        }
+        existing = self.get_pull_request(repo_slug, pr_id, project=project)
+        url = f"{self._repo_url(repo_slug, project)}/pull-requests/{pr_id}/merge"
+        params: Dict[str, Any] = {"version": existing["version"]}
+        payload: Dict[str, Any] = {}
         if message:
             payload["message"] = message
-        return self._request("POST", url, json=payload)
+        return self._request("POST", url, params=params, json=payload)
 
     def decline_pull_request(
-        self, repo_slug: str, pr_id: int, workspace: Optional[str] = None,
+        self, repo_slug: str, pr_id: int, project: Optional[str] = None,
     ) -> Dict[str, Any]:
-        url = f"{self._repo_url(repo_slug, workspace)}/pullrequests/{pr_id}/decline"
-        return self._request("POST", url)
+        existing = self.get_pull_request(repo_slug, pr_id, project=project)
+        url = f"{self._repo_url(repo_slug, project)}/pull-requests/{pr_id}/decline"
+        params = {"version": existing["version"]}
+        return self._request("POST", url, params=params)
 
     # ===== COMMENTS =====
 
     def list_pr_comments(
-        self, repo_slug: str, pr_id: int, page: int = 1,
-        pagelen: int = 50, workspace: Optional[str] = None,
+        self, repo_slug: str, pr_id: int, start: int = 0,
+        limit: int = 50, project: Optional[str] = None,
     ) -> Dict[str, Any]:
-        url = f"{self._repo_url(repo_slug, workspace)}/pullrequests/{pr_id}/comments"
-        params = {"page": page, "pagelen": pagelen}
+        url = f"{self._repo_url(repo_slug, project)}/pull-requests/{pr_id}/comments"
+        params = {"start": start, "limit": limit}
         return self._request("GET", url, params=params)
 
     def add_pr_comment(
         self, repo_slug: str, pr_id: int, text: str,
-        parent_id: Optional[int] = None, workspace: Optional[str] = None,
+        parent_id: Optional[int] = None, project: Optional[str] = None,
     ) -> Dict[str, Any]:
-        url = f"{self._repo_url(repo_slug, workspace)}/pullrequests/{pr_id}/comments"
-        payload: Dict[str, Any] = {"content": {"raw": text}}
+        url = f"{self._repo_url(repo_slug, project)}/pull-requests/{pr_id}/comments"
+        payload: Dict[str, Any] = {"text": text}
         if parent_id:
             payload["parent"] = {"id": parent_id}
         return self._request("POST", url, json=payload)
 
     def add_pr_inline_comment(
         self, repo_slug: str, pr_id: int, text: str, file_path: str,
-        to_line: Optional[int] = None, from_line: Optional[int] = None,
-        workspace: Optional[str] = None,
+        line: Optional[int] = None, line_type: str = "ADDED",
+        project: Optional[str] = None,
     ) -> Dict[str, Any]:
-        url = f"{self._repo_url(repo_slug, workspace)}/pullrequests/{pr_id}/comments"
-        inline: Dict[str, Any] = {"path": file_path}
-        if to_line is not None:
-            inline["to"] = to_line
-        if from_line is not None:
-            inline["from"] = from_line
-        payload: Dict[str, Any] = {"content": {"raw": text}, "inline": inline}
+        url = f"{self._repo_url(repo_slug, project)}/pull-requests/{pr_id}/comments"
+        payload: Dict[str, Any] = {
+            "text": text,
+            "anchor": {
+                "path": file_path,
+                "fileType": "TO",
+                "lineType": line_type,
+            },
+        }
+        if line is not None:
+            payload["anchor"]["line"] = line
         return self._request("POST", url, json=payload)
 
     # ===== REVIEW =====
 
     def approve_pull_request(
-        self, repo_slug: str, pr_id: int, workspace: Optional[str] = None,
+        self, repo_slug: str, pr_id: int, user_slug: str,
+        project: Optional[str] = None,
     ) -> Dict[str, Any]:
-        url = f"{self._repo_url(repo_slug, workspace)}/pullrequests/{pr_id}/approve"
-        return self._request("POST", url)
+        url = f"{self._repo_url(repo_slug, project)}/pull-requests/{pr_id}/participants/{user_slug}"
+        payload = {"user": {"name": user_slug}, "approved": True, "status": "APPROVED"}
+        return self._request("PUT", url, json=payload)
 
     def get_pr_diff(
-        self, repo_slug: str, pr_id: int, workspace: Optional[str] = None,
+        self, repo_slug: str, pr_id: int, project: Optional[str] = None,
     ) -> str:
-        url = f"{self._repo_url(repo_slug, workspace)}/pullrequests/{pr_id}/diff"
+        url = f"{self._repo_url(repo_slug, project)}/pull-requests/{pr_id}/diff"
         return self._request("GET", url, accept="text/plain")
-
-    # ===== PIPELINES =====
-
-    def list_pipelines(
-        self, repo_slug: str, page: int = 1, pagelen: int = 25,
-        workspace: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        url = f"{self._repo_url(repo_slug, workspace)}/pipelines/"
-        params = {"page": page, "pagelen": pagelen, "sort": "-created_on"}
-        return self._request("GET", url, params=params)
-
-    def get_pipeline(
-        self, repo_slug: str, pipeline_uuid: str, workspace: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        url = f"{self._repo_url(repo_slug, workspace)}/pipelines/{pipeline_uuid}"
-        return self._request("GET", url)
-
-    def get_pipeline_steps(
-        self, repo_slug: str, pipeline_uuid: str, workspace: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        url = f"{self._repo_url(repo_slug, workspace)}/pipelines/{pipeline_uuid}/steps/"
-        return self._request("GET", url)
-
-    def get_pipeline_step_log(
-        self, repo_slug: str, pipeline_uuid: str, step_uuid: str,
-        workspace: Optional[str] = None,
-    ) -> str:
-        url = f"{self._repo_url(repo_slug, workspace)}/pipelines/{pipeline_uuid}/steps/{step_uuid}/log"
-        return self._request("GET", url, accept="application/octet-stream")
