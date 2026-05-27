@@ -3,7 +3,7 @@
 import requests
 from typing import Any, Dict, List, Optional
 
-from bitbucket_mcp.errors import BitbucketError, handle_api_error
+from bitbucket_mcp.errors import BadRequestError, BitbucketError, handle_api_error
 
 
 class BitbucketClient:
@@ -21,6 +21,94 @@ class BitbucketClient:
     def _repo_url(self, repo_slug: str, project: Optional[str] = None) -> str:
         proj = project or self.project
         return f"{self.base_url}/projects/{proj}/repos/{repo_slug}"
+
+    @staticmethod
+    def _normalize_comment_anchor(anchor: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not anchor:
+            return None
+
+        normalized = {
+            "path": anchor.get("path") or anchor.get("toPath") or anchor.get("srcPath"),
+            "line": anchor.get("line") or anchor.get("lineNumber") or anchor.get("to"),
+            "lineType": anchor.get("lineType"),
+        }
+
+        if all(value is None for value in normalized.values()):
+            return anchor
+        return normalized
+
+    def _upsert_activity_comment(
+        self,
+        comment: Optional[Dict[str, Any]],
+        anchor: Optional[Dict[str, Any]],
+        comments_by_id: Dict[int, Dict[str, Any]],
+        ordered_ids: List[int],
+        parent_id: Optional[int] = None,
+    ) -> None:
+        if not comment:
+            return
+
+        comment_id = comment.get("id")
+        if comment_id is None:
+            return
+
+        comment_data = dict(comment)
+        normalized_anchor = self._normalize_comment_anchor(anchor or comment.get("anchor"))
+        if normalized_anchor and "anchor" not in comment_data:
+            comment_data["anchor"] = normalized_anchor
+        if parent_id is not None and "parent" not in comment_data:
+            comment_data["parent"] = {"id": parent_id}
+
+        existing = comments_by_id.get(comment_id)
+        if existing is None:
+            comments_by_id[comment_id] = comment_data
+            ordered_ids.append(comment_id)
+        else:
+            existing.update(comment_data)
+            comment_data = existing
+
+        for reply in comment.get("comments", []):
+            self._upsert_activity_comment(
+                reply,
+                comment_data.get("anchor"),
+                comments_by_id,
+                ordered_ids,
+                parent_id=comment_id,
+            )
+
+    def _comments_from_activities(self, activities: Dict[str, Any]) -> Dict[str, Any]:
+        comments_by_id: Dict[int, Dict[str, Any]] = {}
+        ordered_ids: List[int] = []
+
+        for activity in activities.get("values", []):
+            if activity.get("action") != "COMMENTED":
+                continue
+
+            comment = activity.get("comment")
+            if not comment:
+                continue
+
+            comment_id = comment.get("id")
+            if activity.get("commentAction") == "DELETED":
+                if comment_id in comments_by_id:
+                    del comments_by_id[comment_id]
+                    ordered_ids = [cid for cid in ordered_ids if cid != comment_id]
+                continue
+
+            self._upsert_activity_comment(
+                comment,
+                activity.get("commentAnchor"),
+                comments_by_id,
+                ordered_ids,
+            )
+
+        return {
+            "size": len(ordered_ids),
+            "limit": activities.get("limit", len(ordered_ids)),
+            "isLastPage": activities.get("isLastPage", True),
+            "start": activities.get("start", 0),
+            "values": [comments_by_id[cid] for cid in ordered_ids if cid in comments_by_id],
+        }
 
     def _request(
         self,
@@ -163,7 +251,15 @@ class BitbucketClient:
     ) -> Dict[str, Any]:
         url = f"{self._repo_url(repo_slug, project)}/pull-requests/{pr_id}/comments"
         params = {"start": start, "limit": limit}
-        return self._request("GET", url, params=params)
+        try:
+            return self._request("GET", url, params=params)
+        except BadRequestError as e:
+            if "path query parameter is required" not in e.message.lower():
+                raise
+
+            activities_url = f"{self._repo_url(repo_slug, project)}/pull-requests/{pr_id}/activities"
+            activities = self._request("GET", activities_url, params=params)
+            return self._comments_from_activities(activities)
 
     def add_pr_comment(
         self, repo_slug: str, pr_id: int, text: str,
