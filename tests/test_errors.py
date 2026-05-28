@@ -64,6 +64,15 @@ class TestHandleApiError:
         with pytest.raises(RateLimitError):
             handle_api_error(resp)
 
+    def test_server_error_uses_server_error_envelope_message(self):
+        resp = self._mock_response(
+            400,
+            {"errors": [{"message": "The path query parameter is required when retrieving comments."}]},
+            text='{"errors":[{"message":"The path query parameter is required when retrieving comments."}]}',
+        )
+        with pytest.raises(BitbucketError, match="The path query parameter is required when retrieving comments."):
+            handle_api_error(resp)
+
     def test_non_json_response(self):
         resp = self._mock_response(500, json_body=None, text="Internal Server Error")
         with pytest.raises(BitbucketError, match="Internal Server Error"):
