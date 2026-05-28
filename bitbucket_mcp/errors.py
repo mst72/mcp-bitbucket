@@ -53,7 +53,12 @@ class ServerError(BitbucketError):
 def handle_api_error(response: requests.Response) -> None:
     try:
         error_data = response.json()
-        error_message = error_data.get("error", {}).get("message", response.text)
+        error_message = (
+            error_data.get("error", {}).get("message")
+            or next((err.get("message", "") for err in error_data.get("errors", [])), "")
+            or response.text
+            or f"HTTP {response.status_code}"
+        )
         details = str(error_data)
     except Exception:
         error_message = response.text or f"HTTP {response.status_code}"

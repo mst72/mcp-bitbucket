@@ -1,7 +1,7 @@
 """Bitbucket Server/Data Center REST API client."""
 
 import requests
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from bitbucket_mcp.errors import BadRequestError, BitbucketError, handle_api_error
 
@@ -43,6 +43,7 @@ class BitbucketClient:
         anchor: Optional[Dict[str, Any]],
         comments_by_id: Dict[int, Dict[str, Any]],
         ordered_ids: List[int],
+        parent_to_children: Dict[int, Set[int]],
         parent_id: Optional[int] = None,
     ) -> None:
         if not comment:
@@ -59,6 +60,10 @@ class BitbucketClient:
         if parent_id is not None and "parent" not in comment_data:
             comment_data["parent"] = {"id": parent_id}
 
+        actual_parent_id = comment_data.get("parent", {}).get("id")
+        if actual_parent_id is not None:
+            parent_to_children.setdefault(actual_parent_id, set()).add(comment_id)
+
         existing = comments_by_id.get(comment_id)
         if existing is None:
             comments_by_id[comment_id] = comment_data
@@ -73,13 +78,39 @@ class BitbucketClient:
                 comment_data.get("anchor"),
                 comments_by_id,
                 ordered_ids,
+                parent_to_children,
                 parent_id=comment_id,
             )
 
-    def _comments_from_activities(self, activities: Dict[str, Any]) -> Dict[str, Any]:
-        comments_by_id: Dict[int, Dict[str, Any]] = {}
-        ordered_ids: List[int] = []
+    def _remove_comment_subtree(
+        self,
+        comment_id: int,
+        comments_by_id: Dict[int, Dict[str, Any]],
+        ordered_ids: List[int],
+        parent_to_children: Dict[int, Set[int]],
+    ) -> None:
+        for child_id in list(parent_to_children.get(comment_id, set())):
+            self._remove_comment_subtree(child_id, comments_by_id, ordered_ids, parent_to_children)
 
+        comment = comments_by_id.pop(comment_id, None)
+        ordered_ids[:] = [cid for cid in ordered_ids if cid != comment_id]
+
+        if comment:
+            parent_id = comment.get("parent", {}).get("id")
+            if parent_id is not None and parent_id in parent_to_children:
+                parent_to_children[parent_id].discard(comment_id)
+                if not parent_to_children[parent_id]:
+                    del parent_to_children[parent_id]
+
+        parent_to_children.pop(comment_id, None)
+
+    def _consume_activity_page(
+        self,
+        activities: Dict[str, Any],
+        comments_by_id: Dict[int, Dict[str, Any]],
+        ordered_ids: List[int],
+        parent_to_children: Dict[int, Set[int]],
+    ) -> None:
         for activity in activities.get("values", []):
             if activity.get("action") != "COMMENTED":
                 continue
@@ -91,8 +122,12 @@ class BitbucketClient:
             comment_id = comment.get("id")
             if activity.get("commentAction") == "DELETED":
                 if comment_id in comments_by_id:
-                    del comments_by_id[comment_id]
-                    ordered_ids = [cid for cid in ordered_ids if cid != comment_id]
+                    self._remove_comment_subtree(
+                        comment_id,
+                        comments_by_id,
+                        ordered_ids,
+                        parent_to_children,
+                    )
                 continue
 
             self._upsert_activity_comment(
@@ -100,14 +135,57 @@ class BitbucketClient:
                 activity.get("commentAnchor"),
                 comments_by_id,
                 ordered_ids,
+                parent_to_children,
             )
 
+    def _comments_from_activities(
+        self,
+        repo_slug: str,
+        pr_id: int,
+        start: int,
+        limit: int,
+        project: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        comments_by_id: Dict[int, Dict[str, Any]] = {}
+        ordered_ids: List[int] = []
+        parent_to_children: Dict[int, Set[int]] = {}
+        activities_url = f"{self._repo_url(repo_slug, project)}/pull-requests/{pr_id}/activities"
+        activity_start = 0
+        activity_limit = max(limit, 50)
+
+        while True:
+            activities = self._request(
+                "GET",
+                activities_url,
+                params={"start": activity_start, "limit": activity_limit},
+            )
+            self._consume_activity_page(
+                activities,
+                comments_by_id,
+                ordered_ids,
+                parent_to_children,
+            )
+
+            if activities.get("isLastPage", True):
+                break
+
+            next_page_start = activities.get("nextPageStart")
+            if next_page_start is None:
+                batch_size = len(activities.get("values", []))
+                if batch_size == 0:
+                    break
+                next_page_start = activity_start + batch_size
+            activity_start = next_page_start
+
+        total_comments = len(ordered_ids)
+        page_comment_ids = ordered_ids[start:start + limit]
+
         return {
-            "size": len(ordered_ids),
-            "limit": activities.get("limit", len(ordered_ids)),
-            "isLastPage": activities.get("isLastPage", True),
-            "start": activities.get("start", 0),
-            "values": [comments_by_id[cid] for cid in ordered_ids if cid in comments_by_id],
+            "size": total_comments,
+            "limit": limit,
+            "isLastPage": start + len(page_comment_ids) >= total_comments,
+            "start": start,
+            "values": [comments_by_id[cid] for cid in page_comment_ids if cid in comments_by_id],
         }
 
     def _request(
@@ -257,9 +335,13 @@ class BitbucketClient:
             if "path query parameter is required" not in e.message.lower():
                 raise
 
-            activities_url = f"{self._repo_url(repo_slug, project)}/pull-requests/{pr_id}/activities"
-            activities = self._request("GET", activities_url, params=params)
-            return self._comments_from_activities(activities)
+            return self._comments_from_activities(
+                repo_slug,
+                pr_id,
+                start=start,
+                limit=limit,
+                project=project,
+            )
 
     def add_pr_comment(
         self, repo_slug: str, pr_id: int, text: str,

@@ -90,3 +90,155 @@ class TestListPrCommentsFallback:
         assert result["values"][1]["anchor"]["path"] == "README.md"
         assert result["values"][1]["anchor"]["line"] == 12
         assert result["values"][2]["parent"]["id"] == 14666
+
+    @responses.activate
+    def test_deleted_parent_removes_reply_subtree(self):
+        client = make_client()
+        responses.add(
+            responses.GET,
+            f"{BASE}/projects/SPGAIIN/repos/spg-ai-qa-flow/pull-requests/9/comments",
+            json={
+                "errors": [
+                    {
+                        "context": None,
+                        "message": "The path query parameter is required when retrieving comments.",
+                        "exceptionName": None,
+                    }
+                ]
+            },
+            status=400,
+        )
+        responses.add(
+            responses.GET,
+            f"{BASE}/projects/SPGAIIN/repos/spg-ai-qa-flow/pull-requests/9/activities",
+            json={
+                "size": 2,
+                "limit": 50,
+                "isLastPage": True,
+                "start": 0,
+                "values": [
+                    {
+                        "action": "COMMENTED",
+                        "commentAction": "ADDED",
+                        "comment": {
+                            "id": 100,
+                            "text": "Parent comment",
+                            "author": {"displayName": "Reviewer"},
+                            "comments": [
+                                {
+                                    "id": 101,
+                                    "text": "Reply one",
+                                    "author": {"displayName": "Author"},
+                                    "comments": [],
+                                },
+                                {
+                                    "id": 102,
+                                    "text": "Reply two",
+                                    "author": {"displayName": "Author"},
+                                    "comments": [],
+                                },
+                            ],
+                        },
+                    },
+                    {
+                        "action": "COMMENTED",
+                        "commentAction": "DELETED",
+                        "comment": {
+                            "id": 100,
+                            "text": "Parent comment",
+                            "author": {"displayName": "Reviewer"},
+                            "comments": [],
+                        },
+                    },
+                ],
+            },
+        )
+
+        result = client.list_pr_comments("spg-ai-qa-flow", 9)
+
+        assert result["values"] == []
+        assert result["size"] == 0
+
+    @responses.activate
+    def test_paginates_activities_until_comment_page_is_complete(self):
+        client = make_client()
+        responses.add(
+            responses.GET,
+            f"{BASE}/projects/SPGAIIN/repos/spg-ai-qa-flow/pull-requests/9/comments",
+            json={
+                "errors": [
+                    {
+                        "context": None,
+                        "message": "The path query parameter is required when retrieving comments.",
+                        "exceptionName": None,
+                    }
+                ]
+            },
+            status=400,
+        )
+        responses.add(
+            responses.GET,
+            f"{BASE}/projects/SPGAIIN/repos/spg-ai-qa-flow/pull-requests/9/activities",
+            match=[responses.matchers.query_param_matcher({"start": "0", "limit": "50"})],
+            json={
+                "size": 50,
+                "limit": 50,
+                "isLastPage": False,
+                "start": 0,
+                "nextPageStart": 50,
+                "values": [
+                    {"action": "APPROVED"},
+                    {
+                        "action": "COMMENTED",
+                        "commentAction": "ADDED",
+                        "comment": {
+                            "id": 201,
+                            "text": "First comment",
+                            "author": {"displayName": "Reviewer"},
+                            "comments": [],
+                        },
+                    },
+                ],
+            },
+        )
+        responses.add(
+            responses.GET,
+            f"{BASE}/projects/SPGAIIN/repos/spg-ai-qa-flow/pull-requests/9/activities",
+            match=[responses.matchers.query_param_matcher({"start": "50", "limit": "50"})],
+            json={
+                "size": 2,
+                "limit": 50,
+                "isLastPage": True,
+                "start": 50,
+                "values": [
+                    {
+                        "action": "COMMENTED",
+                        "commentAction": "ADDED",
+                        "comment": {
+                            "id": 202,
+                            "text": "Second comment",
+                            "author": {"displayName": "Reviewer"},
+                            "comments": [],
+                        },
+                    },
+                    {
+                        "action": "COMMENTED",
+                        "commentAction": "ADDED",
+                        "comment": {
+                            "id": 203,
+                            "text": "Third comment",
+                            "author": {"displayName": "Reviewer"},
+                            "comments": [],
+                        },
+                    },
+                ],
+            },
+        )
+
+        result = client.list_pr_comments("spg-ai-qa-flow", 9, start=1, limit=2)
+
+        assert [comment["id"] for comment in result["values"]] == [202, 203]
+        assert result["size"] == 3
+        assert result["start"] == 1
+        assert result["limit"] == 2
+        assert result["isLastPage"] is True
